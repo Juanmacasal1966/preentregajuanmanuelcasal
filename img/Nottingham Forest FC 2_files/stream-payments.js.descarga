@@ -1,0 +1,394 @@
+var streamPayments = (function () {
+
+    var apiUrl = "https://forestpayments.streamamg.com/api/v1";
+    var apiLanguage = "en";
+    var sessionDataName = "StreamPaymentSessionData";
+    var packagesName = "StreamPaymentPackages";
+    var loginCallbackName = "StreamPaymentLoginCallback";
+    var jwtToken = "";
+    var jwtLogin = "true" === "true";
+
+    //Initialize function    
+    var init = function (data, language) {
+        loadjQuery();
+        if (typeof data === "string") {
+            console.log("Using obsolete payment init");
+            // Url can no longer be specified it comes from the template value            
+            if (language) {
+                apiLanguage = language;
+            }
+        } else if (typeof data === "object") {
+            jwtToken = data.jwtToken;
+            apiLanguage = data.language;
+        }
+
+        var loginCallback = getCachedData(loginCallbackName);
+        if (loginCallback) {
+            localStorage.removeItem(loginCallbackName);
+            var sessionData = getCachedData(sessionDataName);
+            loginCallback(sessionData);
+        }
+        registerRedirectCleans();
+    };
+
+    var getSubscriptionPackageList = function (options, callback) {
+
+        var packages = getCachedData(packagesName);
+        if (packages) {
+            doCallback(callback, packages);
+            return;
+        }
+
+        var ajaxOptions = {
+            type: "GET",
+            url: apiUrl + "/package/",
+            data: options,
+            success: function (data) {
+                doCallback(callback, data);
+            }
+        };
+
+        $.ajax(prepAjaxOptions(ajaxOptions));
+    };
+
+    var getSessionState = function (options, callback) {
+        console.log("getSessionState called");
+
+        if (typeof (streamLocalSessionDataInUse) != 'undefined') {
+            if (streamLocalSessionDataInUse == true) {
+                console.log("Returning streamLocalSessionData");
+                doCallback(callback, streamLocalSessionData);
+                return;
+            }
+        }
+
+        var sessionData = getCachedData(sessionDataName);
+        var sessionDataValid = false;
+        if (sessionData && sessionData.CurrentCustomerSession) {
+            sessionDataValid = true;
+            var cacheLastUpdatedAt = new Date(sessionData.UpdatedAt);
+            var cacheMaxLastUpdatedAt = new Date();
+            cacheMaxLastUpdatedAt.setMinutes(cacheMaxLastUpdatedAt.getMinutes() - 5);
+
+            // if the cache hasnt expired
+            if (cacheLastUpdatedAt < cacheMaxLastUpdatedAt) {
+                console.log("Cached session state has expired");
+                sessionDataValid = false;
+            }
+
+            // if we are using jwt we should check the session key
+            if (jwtLogin) {
+                if (!sessionData.JwtTokenCacheKey) {
+                    console.log("Cached session does not have a JwtTokenCacheKey");
+                    sessionDataValid = false;
+                }
+                if (sessionData.JwtTokenCacheKey != jwtToken) {
+                    console.log("Cached session JwtTokenCacheKey does not match initlaized cache key");
+                    sessionDataValid = false;
+                }
+            }
+        }
+
+        if (sessionDataValid) {
+            console.log("Using cached value");
+            doCallback(callback, sessionData);
+            return;
+        }
+
+        var ajaxOptions = {
+            type: "GET",
+            url: apiUrl + "/session/prescence/",
+            data: options,
+            success: function (data) {
+                sessionUpdateReceived(data, true);
+                doCallback(callback, data);
+            }
+        };
+
+        $.ajax(prepAjaxOptions(ajaxOptions));
+    };
+
+    var doLogin = function (options, callback) {
+        if (jwtLogin) {
+            console.log("doLogin is not supported for JWT authentication");
+            return;
+        }
+        var ajaxOptions = {
+            type: "GET",
+            url: apiUrl + "/session/start/",
+            data: options,
+            success: function (data) {
+                if (Object.keys(data.ModelErrors).length === 0 && data.PageUrl === null) {
+                    sessionUpdateReceived(data, true);
+
+                    localStorage.setItem(loginCallbackName, callback);
+
+                    var search = window.location.search ? window.location.search + "&callbackurl=" + encodeURIComponent(window.location.href) : "?callbackurl=" + encodeURIComponent(window.location.href);
+
+                    var completePath = apiUrl + "/session/setcookie/" + data.AuthenticationToken + search;
+
+                    console.log('Commplete path:' + completePath);
+
+                    window.location.href = completePath;
+
+                    return;
+                }
+
+                doCallback(callback, data);
+            }
+        };
+
+        $.ajax(prepAjaxOptions(ajaxOptions));
+    };
+
+    var doLoginPost = function (options, callback) {
+        if (jwtLogin) {
+            console.log("doLogin is not supported for JWT authentication");
+            return;
+        }
+
+        function deserialize(serializedString) {
+            serializedString = serializedString.replace(/\+/g, '%20');
+            var formFieldArray = serializedString.split("&");
+            var obj = {};
+            $.each(formFieldArray, function (i, pair) {
+                var nameValue = pair.split("=");
+                var name = decodeURIComponent(nameValue[0]);
+                var value = decodeURIComponent(nameValue[1]);
+
+                obj[name] = value;
+            });
+
+            return obj;
+        }
+
+        var postData = deserialize(options);
+
+        var ajaxOptions = {
+            type: "POST",
+            url: apiUrl + "/session/start/",
+            contentType: "application/json; charset=utf-8",
+            data: JSON.stringify(postData),
+            success: function (data) {
+                if (Object.keys(data.ModelErrors).length === 0) {
+                    sessionUpdateReceived(data, true);
+
+                    localStorage.setItem(loginCallbackName, callback);
+
+                    var search = window.location.search ? window.location.search + "&callbackurl=" + window.location.href : "?callbackurl=" + window.location.href;
+                    window.location.href = apiUrl + "/session/setcookie/" + data.AuthenticationToken + search;
+                    return;
+                }
+
+                doCallback(callback, data);
+            }
+        };
+
+        $.ajax(prepAjaxOptions(ajaxOptions));
+    };
+
+    var doLogout = function (options, callback) {
+        var ajaxOptions = {
+            type: "GET",
+            url: apiUrl + "/session/terminate/",
+            data: options,
+            success: function (data) {
+                cleanStatus();
+                doCallback(callback, data);
+            }
+        };
+
+        $.ajax(prepAjaxOptions(ajaxOptions));
+    };
+
+    var getKSession = function (options, callback) {
+        var ajaxOptions = {
+            type: "GET",
+            url: apiUrl + "/session/ksession/",
+            data: options,
+            success: function (data) {
+                if (data != null && data.ErrorMessage != null) {
+                    console.log(data.ErrorMessage);
+                }
+                doCallback(callback, data);
+            }
+        };
+
+        $.ajax(prepAjaxOptions(ajaxOptions));
+    };
+
+    var isEmailAddressValid = function (options, callback) {
+        $.ajax({
+            url: apiUrl + "/user/isvalidemail/?lang=" + apiLanguage,
+            type: "POST",
+            data: JSON.stringify(options),
+            contentType: "application/json; charset=utf-8",
+            success: function (data) {
+                doCallback(callback, data);
+            },
+            error: function () {
+            }
+        });
+    };
+
+    var isEmailAddressRegistered = function (options, callback) {
+        if (jwtLogin) {
+            console.log("isEmailAddressRegistered is not supported for JWT authentication");
+            return;
+        }
+        $.ajax({
+            url: apiUrl + "/user/isregisteredemail/?lang=" + apiLanguage,
+            type: "POST",
+            data: JSON.stringify(options),
+            contentType: "application/json; charset=utf-8",
+            success: function (data) {
+                doCallback(callback, data);
+            },
+            error: function () {
+            }
+        });
+    };
+
+    var isVoucherCodeValid = function (options, callback) {
+        $.ajax({
+            url: apiUrl + "/offervoucher/getstatusbycode/?lang=" + apiLanguage,
+            type: "GET",
+            data: options,
+            success: function (data) {
+                doCallback(callback, data);
+            },
+            error: function () {
+            }
+        });
+    };
+
+    var doContactSubmission = function (options, callback) {
+        var ajaxOptions = {
+            type: "POST",
+            contentType: "application/json",
+            data: JSON.stringify(options),
+            url: apiUrl + "/contact",
+            success: function (data) {
+                doCallback(callback, data);
+            }
+        };
+
+        $.ajax(prepAjaxOptions(ajaxOptions));
+    };
+
+    //*** Private functions ***//
+
+    var doCallback = function (fn, data) {
+        if (typeof fn === "function") {
+            fn(data);
+            return;
+        }
+
+        console.log("stream-payments - callback fn not set!");
+    };
+
+    var getCachedData = function (id) {
+
+        var data = localStorage.getItem(id);
+        if (!data) {
+            return;
+        }
+
+        if (data.indexOf("function") === 0) {
+            eval(data.replace("function", "var fn = function"));
+            return fn;
+        }
+
+        return JSON.parse(data);
+    };
+
+    var sessionUpdateReceived = function (data, store) {
+        if (store) {
+            data.UpdatedAt = new Date();
+
+            if (jwtLogin) {
+                data.JwtTokenCacheKey = jwtToken;
+            }
+
+            localStorage.setItem(sessionDataName, JSON.stringify(data));
+        }
+    };
+
+    var cleanStatus = function () {
+        localStorage.removeItem(sessionDataName);
+    };
+
+    var registerRedirectCleans = function () {
+        $("a").click(function () {
+            var url = $(this).attr("href");
+
+            if (url && url.indexOf("https://forestpayments.streamamg.com/") !== -1) {
+                cleanStatus();
+            }
+        });
+    };
+
+    // Perpares the ajax request with CORS if supported or falls back to jsonp
+    var prepAjaxOptions = function (ajaxOptions) {
+        ajaxOptions.url = ajaxOptions.url + "?lang=" + apiLanguage;
+        if (jwtLogin && jwtToken) {
+            ajaxOptions.url = ajaxOptions.url + "&apijwttoken=" + jwtToken;
+        }
+        ajaxOptions.dataType = "jsonp";
+
+        if (hasCorsSupport()) {
+            ajaxOptions.xhrFields =
+            {
+                withCredentials: true
+            };
+
+            ajaxOptions.dataType = "json";
+        }
+
+        return ajaxOptions;
+    };
+
+    // Detects if the browser supports CORS
+    var hasCorsSupport = function () {
+        if ("withCredentials" in new XMLHttpRequest()) {
+            return true;
+        } else if (typeof XDomainRequest !== "undefined") {
+            return true;;
+        } else {
+            return false;
+        }
+    };
+
+    var loadScript = function (url, cache) {
+        var r = Math.floor((Math.random() * 100000000) + 1);
+
+        var script = document.createElement("script");
+        script.src = !cache ? url + "?r=" + r : url;
+        script.type = "text/javascript";
+        document.getElementsByTagName("head")[0].appendChild(script);
+    };
+
+    var loadjQuery = function () {
+        if (typeof $ === "undefined") {
+            loadScript("https://forestpayments.streamamg.com//Assets/Account/js/jquery.min.1.9.1.js", true);
+        }
+    };
+
+
+    //*** End of Private functions ***//
+
+    return {
+        init: init,
+        getSubscriptionPackageList: getSubscriptionPackageList,
+        getSessionState: getSessionState,
+        doLogin: doLogin,
+        doLoginPost: doLoginPost,
+        doLogout: doLogout,
+        doContactSubmission: doContactSubmission,
+        isEmailAddressValid: isEmailAddressValid,
+        isEmailAddressRegistered: isEmailAddressRegistered,
+        isVoucherCodeValid: isVoucherCodeValid,
+        getKSession: getKSession
+    };
+
+}());
